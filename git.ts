@@ -4,21 +4,26 @@
 // third-party code: every byte of the protocol is built here.
 //
 // Speed notes (measured on this box, 1 KiB blobs):
-//   * Pack entries are located by their Adler-32 trailer instead of by
-//     probing inflateSync until it stops throwing: ~7x faster to read a
-//     pack, ~17x on a 64 KiB blob. A receive-pack is dominated by pack
-//     reading, so this is the single biggest win in the forge.
+//   * A pack entry's zlib stream is located in one inflate: inflateSync
+//     stops at the first stream's end and, with { info: true }, its engine
+//     reports exactly how many input bytes it consumed, so the stream's end
+//     needs no trailer scan and no second, confirming inflate. The Adler-32
+//     trailer is still checked, and a disagreement falls back to the scan,
+//     so the answer stays right on any Node. A receive-pack is dominated by
+//     pack reading, so this is the single biggest win in the forge.
+//   * SHA-1 is the one-shot crypto.hash, not a Hash object per object.
 //   * A commit's parents are memoised per repo (objects never change under
 //     an oid), so ancestry walks parse each commit at most once.
 
-import { createHash } from 'node:crypto';
+import { hash as cryptoHash } from 'node:crypto';
 import { inflateSync as zlibInflate, deflateSync as zlibDeflate } from 'node:zlib';
 import type { Repo } from './store.ts';
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
 
+/** One-shot SHA-1 hex: no Hash object is allocated per object. */
 export function sha1Hex(data: Buffer): string {
-  return createHash('sha1').update(data).digest('hex');
+  return cryptoHash('sha1', data, 'hex');
 }
 
 /** An object's id: sha1("<type> <length>\0" + body). */
@@ -340,19 +345,50 @@ function adler32(data: Buffer): number {
 }
 
 /**
- * Where the zlib stream at `start` ends. inflateSync stops at the end of
- * the first stream and ignores trailing bytes, so one full inflate gives
- * the entry's bytes; the stream's own Adler-32 trailer then says exactly
- * where it ended. A second, bounded inflate confirms the candidate: the
- * first candidate whose bounded inflate reproduces the bytes is the true
- * end (an earlier accidental match of the trailer bytes is truncated and
- * throws, so the scan simply moves on to the next match). This replaces
- * probing inflateSync at growing end positions — every failed probe throws,
- * and throwing is the slow part.
+ * Inflate the one zlib stream starting at `start` and return its bytes plus
+ * the offset just past its Adler-32 trailer, in a single inflate.
+ *
+ * inflateSync stops at the end of the first stream and ignores trailing
+ * bytes, so inflating the remainder of the pack gives exactly this entry's
+ * bytes; with `{ info: true }` its engine reports how many input bytes it
+ * consumed, which is the stream's own length — no scan for the trailer and
+ * no second, confirming inflate. The four bytes before that end must be
+ * this stream's Adler-32 trailer; when they are not (an engine that reports
+ * consumption differently), the trailer scan below is the fallback, so the
+ * answer stays right on any Node instead of trusting one runtime's counter.
  */
-function zlibStreamEnd(buf: Buffer, start: number): number {
-  const packEnd = buf.length - 20; // the pack's 20-byte SHA-1 trailer
-  const data = zlibInflate(buf.subarray(start, packEnd));
+function inflateEntry(
+  buf: Buffer,
+  start: number,
+  packEnd: number,
+): { data: Buffer; end: number } {
+  const { buffer: data, engine } = zlibInflate(buf.subarray(start, packEnd), { info: true }) as {
+    buffer: Buffer;
+    engine: { bytesWritten: number };
+  };
+  const end = start + engine.bytesWritten;
+  if (end > start + 2 && end <= packEnd) {
+    const trailer = Buffer.alloc(4);
+    trailer.writeUInt32BE(adler32(data), 0);
+    if (buf.subarray(end - 4, end).equals(trailer)) return { data, end };
+  }
+  return inflateEntrySlow(buf, start, packEnd, data);
+}
+
+/**
+ * The fallback inflateEntry uses when the engine's consumed-byte count does
+ * not land on the stream's Adler-32 trailer: scan the pack for the trailer
+ * bytes and confirm the first candidate whose bounded inflate reproduces
+ * the entry's bytes (an earlier accidental match is truncated and throws,
+ * so the scan simply moves on). Slower, and only ever reached when the fast
+ * path's counter disagrees with the bytes.
+ */
+function inflateEntrySlow(
+  buf: Buffer,
+  start: number,
+  packEnd: number,
+  data: Buffer,
+): { data: Buffer; end: number } {
   const trailer = Buffer.alloc(4);
   trailer.writeUInt32BE(adler32(data), 0);
   let searchFrom = start + 2; // a zlib header is 2 bytes, so no trailer starts earlier
@@ -362,7 +398,7 @@ function zlibStreamEnd(buf: Buffer, start: number): number {
     const end = pos + 4;
     try {
       const check = zlibInflate(buf.subarray(start, end));
-      if (check.length === data.length && check.equals(data)) return end;
+      if (check.length === data.length && check.equals(data)) return { data, end };
     } catch {
       // A truncated stream: this match was a coincidence inside the data.
     }
@@ -370,15 +406,22 @@ function zlibStreamEnd(buf: Buffer, start: number): number {
   }
 }
 
-/** Read one packfile; resolve deltas against the pack itself and `resolveBase`. */
+/**
+ * Read one packfile; resolve deltas against the pack itself and `resolveBase`.
+ * Each resolved object is also handed to `sink` as it is finalised, so a
+ * caller that is about to store the objects anyway (receive-pack) pays no
+ * second pass over the map.
+ */
 export function readPack(
   buf: Buffer,
   resolveBase?: (oid: string) => GitObject | undefined,
+  sink?: Map<string, GitObject>,
 ): Map<string, GitObject> {
   if (buf.length < 12 || buf.toString('ascii', 0, 4) !== 'PACK') throw new Error('not a packfile');
   const version = buf.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`pack version ${version}`);
   const count = buf.readUInt32BE(8);
+  const packEnd = buf.length - 20; // the pack's 20-byte SHA-1 trailer
   const entries: PackEntry[] = [];
   let off = 12;
   for (let n = 0; n < count; n += 1) {
@@ -407,8 +450,7 @@ export function readPack(
       baseOid = buf.subarray(i, i + 20).toString('hex');
       i += 20;
     }
-    const end = zlibStreamEnd(buf, i);
-    const data = zlibInflate(buf.subarray(i, end));
+    const { data, end } = inflateEntry(buf, i, packEnd);
     if (data.length !== size) throw new Error('pack entry size mismatch');
     entries.push({ offset: start, typeNum, type: OBJ_TYPE_NAMES[typeNum] ?? '', size, data, baseOffset, baseOid });
     off = end;
@@ -449,6 +491,7 @@ export function readPack(
     const oid = objectId(obj.type, obj.data);
     resolved.set(oid, obj);
     byOid.set(oid, obj);
+    sink?.set(oid, obj);
   }
   return resolved;
 }
@@ -927,9 +970,9 @@ export interface PushOutcome {
 /** Apply a receive-pack: store the pack's objects, then apply each ref command. */
 export function handleReceivePack(repo: Repo, commands: PushCommand[], packBytes: Buffer | null): PushOutcome {
   if (packBytes !== null && packBytes.length > 0) {
-    let objects: Map<string, GitObject>;
     try {
-      objects = readPack(packBytes, (oid) => repo.objects.get(oid));
+      // Objects land in the repo's map as they resolve: no second pass.
+      readPack(packBytes, (oid) => repo.objects.get(oid), repo.objects);
     } catch {
       return {
         unpackOk: false,
@@ -937,7 +980,6 @@ export function handleReceivePack(repo: Repo, commands: PushCommand[], packBytes
         refs: commands.map((c) => ({ ref: c.ref, ok: false, reason: 'unpacker error' })),
       };
     }
-    for (const [oid, obj] of objects) repo.objects.set(oid, obj);
   }
   const refs: PushOutcome['refs'] = [];
   for (const cmd of commands) {

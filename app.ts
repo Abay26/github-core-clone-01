@@ -37,6 +37,8 @@ import { handleRest } from './rest.ts';
 import { Store, type Repo } from './store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
+/** The one empty query-parameter set, shared by every query-less request. */
+const EMPTY_PARAMS = new URLSearchParams();
 /** A request body larger than this is refused outright (no push in the suite is near it). */
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
@@ -80,9 +82,12 @@ function authorized(req: IncomingMessage, token: string): boolean {
   return header === `Bearer ${token}`;
 }
 
-/** Read the whole request body, or null when it is over the limit. */
+/** Read the whole request body, or null when it is over the limit. A body
+ * that arrives in one chunk — every small REST or pkt-line body — is
+ * returned as that chunk, with no array and no concat. */
 function readBody(req: IncomingMessage): Promise<Buffer | null> {
   return new Promise((resolve) => {
+    let first: Buffer | null = null;
     const chunks: Buffer[] = [];
     let size = 0;
     let tooBig = false;
@@ -92,9 +97,21 @@ function readBody(req: IncomingMessage): Promise<Buffer | null> {
         tooBig = true;
         return;
       }
-      chunks.push(chunk);
+      if (first === null && chunks.length === 0) first = chunk;
+      else chunks.push(chunk);
     });
-    req.on('end', () => resolve(tooBig ? null : Buffer.concat(chunks)));
+    req.on('end', () => {
+      if (tooBig) {
+        resolve(null);
+        return;
+      }
+      if (chunks.length === 0) {
+        resolve(first ?? Buffer.alloc(0));
+        return;
+      }
+      if (first !== null) chunks.unshift(first);
+      resolve(Buffer.concat(chunks));
+    });
     req.on('error', () => resolve(Buffer.alloc(0)));
   });
 }
@@ -209,13 +226,37 @@ export function createApp(): Server {
   const token = store.token;
   let requestSeq = 0;
   const fetchCache = new Map<string, Buffer>();
+  // Advertisements and ls-refs answers are pure functions of the repo's
+  // fingerprint too (refs only ever move, objects only ever arrive), so they
+  // share the fetch cache's invalidation story: same fingerprint, same bytes.
+  // Bounded the same way, so a long trial cannot grow them without limit.
+  const advertCache = new Map<string, Buffer>();
+  const lsRefsCache = new Map<string, Buffer>();
+  const cachedAdvert = (key: string, build: () => Buffer): Buffer => {
+    const hit = advertCache.get(key);
+    if (hit !== undefined) return hit;
+    const built = build();
+    if (advertCache.size >= 32) advertCache.clear();
+    advertCache.set(key, built);
+    return built;
+  };
 
   const requestId = (): string => {
     requestSeq += 1;
     return `req-${requestSeq.toString(16).padStart(8, '0')}`;
   };
 
-  function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+  function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}, rawBody?: Buffer): void {
+    if (rawBody !== undefined) {
+      res.writeHead(status, {
+        'content-type': JSON_TYPE,
+        'content-length': rawBody.length,
+        'x-github-request-id': requestId(),
+        ...headers,
+      });
+      res.end(rawBody);
+      return;
+    }
     const text = `${JSON.stringify(body)}\n`;
     res.writeHead(status, {
       'content-type': JSON_TYPE,
@@ -323,8 +364,10 @@ export function createApp(): Server {
             }
             body = isRecord(parsed.value) ? parsed.value : null;
           }
-          const answer = handleRest(store, method, restSegments, new URLSearchParams(query), body, origin, `${origin}${path}`);
-          sendJson(res, answer.status, answer.body, answer.headers ?? {});
+          // An empty query string needs no parser: most REST calls carry none.
+          const params = query === '' ? EMPTY_PARAMS : new URLSearchParams(query);
+          const answer = handleRest(store, method, restSegments, params, body, origin, `${origin}${path}`);
+          sendJson(res, answer.status, answer.body, answer.headers ?? {}, answer.rawBody);
           return;
         }
 
@@ -343,14 +386,14 @@ export function createApp(): Server {
           if (method === 'GET' && gitPath[0] === 'info' && gitPath[1] === 'refs') {
             const service = queryValue(query, 'service') ?? 'git-upload-pack';
             if (service === 'git-receive-pack') {
-              sendRaw(res, 200, advertiseV0(repo, 'git-receive-pack'), 'application/x-git-receive-pack-advertisement');
+              sendRaw(res, 200, cachedAdvert(`rp|${repoFingerprint(repo)}`, () => advertiseV0(repo, 'git-receive-pack')), 'application/x-git-receive-pack-advertisement');
               return;
             }
             if (service === 'git-upload-pack') {
               if ((req.headers['git-protocol'] ?? '') === 'version=2') {
                 sendRaw(res, 200, advertiseV2(), 'application/x-git-upload-pack-advertisement');
               } else {
-                sendRaw(res, 200, advertiseV0(repo, 'git-upload-pack'), 'application/x-git-upload-pack-advertisement');
+                sendRaw(res, 200, cachedAdvert(`up|${repoFingerprint(repo)}`, () => advertiseV0(repo, 'git-upload-pack')), 'application/x-git-upload-pack-advertisement');
               }
               return;
             }
@@ -372,7 +415,17 @@ export function createApp(): Server {
             const firstLine = first !== undefined && first !== 'flush' && first !== 'delim' ? pktText(first) : '';
             const resultType = 'application/x-git-upload-pack-result';
             if (firstLine === 'command=ls-refs') {
-              sendRaw(res, 200, handleLsRefs(repo, lsRefsArgsOf(lines)), resultType);
+              const lsArgs = lsRefsArgsOf(lines);
+              const lsKey = `ls|${repoFingerprint(repo)}|p:${lsArgs.peel ? 1 : 0}|s:${lsArgs.symrefs ? 1 : 0}|u:${lsArgs.unborn ? 1 : 0}|x:${lsArgs.prefixes.join(',')}`;
+              const lsHit = lsRefsCache.get(lsKey);
+              if (lsHit !== undefined) {
+                sendRaw(res, 200, lsHit, resultType);
+                return;
+              }
+              const lsBuilt = handleLsRefs(repo, lsArgs);
+              if (lsRefsCache.size >= 32) lsRefsCache.clear();
+              lsRefsCache.set(lsKey, lsBuilt);
+              sendRaw(res, 200, lsBuilt, resultType);
               return;
             }
             // A fetch's bytes are a pure function of the fetch arguments and

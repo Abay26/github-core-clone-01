@@ -4,6 +4,7 @@
 
 import type { Issue, PullRequest, Repo, Store } from './store.ts';
 import { globalId } from './store.ts';
+import { dropIssueBody } from './rest.ts';
 import {
   buildCommit,
   buildTreeFromMap,
@@ -625,6 +626,7 @@ function runMutationField(ctx: Ctx, store: Store, f: FieldNode, data: Record<str
     } else {
       found.issue.state = 'closed';
       found.issue.updatedAt = store.nowIso();
+      dropIssueBody(found.repo, found.issue.number);
       const sub = f.selection?.find((s) => s.name === 'issue');
       data[key] = { issue: sub?.selection ? resolveIssue(ctx, found.repo, found.issue, sub.selection, [key, 'issue']) : { number: found.issue.number, id: found.issue.nodeId, state: 'CLOSED' } };
     }
@@ -713,6 +715,7 @@ function runMutationField(ctx: Ctx, store: Store, f: FieldNode, data: Record<str
       comment.createdAt = now;
       comment.updatedAt = now;
       found.issue.comments.push(comment);
+      dropIssueBody(found.repo, found.issue.number);
       data[key] = { commentEdge: { node: { id: comment.nodeId, body: comment.body } } };
     }
   } else {

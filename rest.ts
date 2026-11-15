@@ -23,10 +23,52 @@ export interface RestResponse {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  /** A body already serialised (JSON text plus its trailing newline): send
+   * it as it is instead of stringifying `body` again. */
+  rawBody?: Buffer;
 }
 
 export function json(status: number, body: unknown, headers: Record<string, string> = {}): RestResponse {
   return { status, body, headers };
+}
+
+/** A response whose body bytes are already built (see the issue cache below). */
+export function jsonRaw(status: number, rawBody: Buffer, headers: Record<string, string> = {}): RestResponse {
+  return { status, body: null, headers, rawBody };
+}
+
+/**
+ * Serialised bodies of single-issue GETs, per repository object: a body's
+ * bytes are a pure function of the issue's fields, the repo and the origin,
+ * so a repeat read of an unchanged issue is a map lookup instead of a fresh
+ * object build and stringify. Keyed by the Repo object itself, so deleting
+ * a repository and recreating one under the same name can never serve the
+ * old repo's bytes. Every mutation of an issue drops that issue's entries;
+ * creating an issue touches no other issue's bytes.
+ */
+const issueBodyCache = new WeakMap<Repo, Map<number, Map<string, Buffer>>>();
+
+/** Forget one issue's cached bodies (call on any mutation of that issue). */
+export function dropIssueBody(repo: Repo, number: number): void {
+  issueBodyCache.get(repo)?.delete(number);
+}
+
+function cachedIssueBody(repo: Repo, number: number, origin: string): Buffer | undefined {
+  return issueBodyCache.get(repo)?.get(number)?.get(origin);
+}
+
+function storeIssueBody(repo: Repo, number: number, origin: string, body: Buffer): void {
+  let byNumber = issueBodyCache.get(repo);
+  if (byNumber === undefined) {
+    byNumber = new Map();
+    issueBodyCache.set(repo, byNumber);
+  }
+  let byOrigin = byNumber.get(number);
+  if (byOrigin === undefined) {
+    byOrigin = new Map();
+    byNumber.set(number, byOrigin);
+  }
+  byOrigin.set(origin, body);
 }
 
 export function notFound(message = 'Not Found'): RestResponse {
@@ -879,6 +921,7 @@ function routeIssues(r: RepoRoute): RestResponse {
       comment.createdAt = now;
       comment.updatedAt = now;
       issue.comments.push(comment);
+      dropIssueBody(repo, issue.number);
       return json(201, commentJson(store, repo, issue, comment, origin));
     }
     return notFound();
@@ -890,7 +933,13 @@ function routeIssues(r: RepoRoute): RestResponse {
     return notFound();
   }
   if (issueSub === undefined) {
-    if (method === 'GET') return json(200, issueJson(store, repo, issue, origin));
+    if (method === 'GET') {
+      const cached = cachedIssueBody(repo, issue.number, origin);
+      if (cached !== undefined) return jsonRaw(200, cached);
+      const raw = Buffer.from(`${JSON.stringify(issueJson(store, repo, issue, origin))}\n`, 'utf8');
+      storeIssueBody(repo, issue.number, origin, raw);
+      return jsonRaw(200, raw);
+    }
     if (method === 'PATCH' && isPlainObject(body)) {
       if (typeof body.title === 'string') issue.title = body.title as string;
       if (typeof body.body === 'string') issue.body = body.body as string;
@@ -903,6 +952,7 @@ function routeIssues(r: RepoRoute): RestResponse {
         issue.labels = labels;
       }
       issue.updatedAt = store.nowIso();
+      dropIssueBody(repo, issue.number);
       return json(200, issueJson(store, repo, issue, origin));
     }
     return notFound();
