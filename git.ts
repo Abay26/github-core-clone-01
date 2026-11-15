@@ -246,16 +246,27 @@ export function mergeBase(repo: Repo, a: string, b: string): string | null {
   return best;
 }
 
-/** Walk commits from `tips`; returns oid -> depth (0 at a tip). */
-export function walkCommits(repo: Repo, tips: string[]): Map<string, number> {
+/**
+ * Walk commits from `tips`; returns oid -> depth (0 at a tip). With
+ * `maxDepth`, only commits at depth <= maxDepth are visited and only commits
+ * below maxDepth are expanded: a depth-limited fetch never needs ancestors
+ * past its depth, so walking the whole history for a shallow fetch is wasted
+ * work (a 200-commit history for a depth-1 fetch). The minimum depth is
+ * still exact: the queue is breadth-first, so the first visit to a commit is
+ * its shallowest, and a commit first reached past maxDepth is one the caller
+ * excludes anyway.
+ */
+export function walkCommits(repo: Repo, tips: string[], maxDepth = Number.POSITIVE_INFINITY): Map<string, number> {
   const depth = new Map<string, number>();
   const queue: Array<[string, number]> = tips.map((t) => [t, 0] as [string, number]);
   let head = 0;
   while (head < queue.length) {
     const [oid, d] = queue[head++]!;
+    if (d > maxDepth) continue;
     const prev = depth.get(oid);
     if (prev !== undefined && prev <= d) continue;
     depth.set(oid, d);
+    if (d === maxDepth) continue;
     for (const p of commitParents(repo, oid)) queue.push([p, d + 1]);
   }
   return depth;
@@ -457,13 +468,18 @@ export function readPack(
   }
   // Resolve deltas. Bases are found by offset (OFS) or by oid (REF): the
   // oid map is filled as objects resolve, so a REF base never needs a scan
-  // that re-hashes every resolved object for every delta.
+  // that re-hashes every resolved object for every delta. The lookup maps
+  // are built lazily: a pack with no deltas (every push in the bench, every
+  // fetch the forge writes) never needs them, and a plain entry never needs
+  // the cycle-detection set either.
+  const hasDelta = entries.some((e) => e.typeNum === 6 || e.typeNum === 7);
   const byOffset = new Map<number, PackEntry>();
-  for (const e of entries) byOffset.set(e.offset, e);
+  if (hasDelta) for (const e of entries) byOffset.set(e.offset, e);
   const resolved = new Map<string, GitObject>();
   const byOid = new Map<string, GitObject>();
-  const resolve = (entry: PackEntry, seen: Set<number>): GitObject => {
+  const resolve = (entry: PackEntry, seen: Set<number> | null): GitObject => {
     if (entry.typeNum === 6 || entry.typeNum === 7) {
+      if (seen === null) seen = new Set<number>();
       if (seen.has(entry.offset)) throw new Error('delta cycle');
       seen.add(entry.offset);
       let base: GitObject;
@@ -487,10 +503,10 @@ export function readPack(
     return { type: entry.type, data: entry.data };
   };
   for (const entry of entries) {
-    const obj = resolve(entry, new Set());
+    const obj = resolve(entry, null);
     const oid = objectId(obj.type, obj.data);
     resolved.set(oid, obj);
-    byOid.set(oid, obj);
+    if (hasDelta) byOid.set(oid, obj);
     sink?.set(oid, obj);
   }
   return resolved;
@@ -655,7 +671,7 @@ export function collectPack(repo: Repo, wants: string[], haves: string[], opts: 
       }
     }
   }
-  const depths = walkCommits(repo, wants);
+  const depths = walkCommits(repo, wants, opts.depth === undefined ? Number.POSITIVE_INFINITY : opts.depth - 1);
   const included = new Map<string, number>();
   for (const [oid, d] of depths) {
     if (heldCommits.has(oid)) continue;
