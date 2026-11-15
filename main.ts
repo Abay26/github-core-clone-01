@@ -1,14 +1,14 @@
-// The entry <-> env lifecycle: bind an ephemeral port, tell the env the port
-// it bound, then poll until the env says the trial is over and exit 0.
+// The entry <-> env lifecycle: bind an ephemeral port, tell the env the
+// port it bound, then poll until the env says the trial is over and exit 0.
 //
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial
 //      container). Without it there is nothing to talk to, so exit 1 at once.
 //   2. Create the server and listen(0): the kernel picks a free port. Never
 //      bind 8080 — the env owns it.
-//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address
-//      the request came from plus N as the base URL and dials it from then on.
-//      The first register wins; a 409 means another entry already registered,
-//      and this process keeps waiting like any other.
+//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the
+//      address the request came from plus N as the base URL and dials it from
+//      then on. The first register wins; a 409 means another entry already
+//      registered, and this process keeps waiting like any other.
 //   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env
 //      answers at once ({"done": false} while the suite runs), so this is a
 //      poll, not a long-held request. A failed or slow poll is retried with a
@@ -42,10 +42,10 @@ function backoffMs(failures: number): number {
 }
 
 /**
- * POST the bound port until the env accepts it. 200 is the normal answer; 409
- * means a first register already won, which is not this process's to fix. 400
- * and 405 are contract errors and end the program; a network error or another
- * status is retried, since the env may still be starting.
+ * POST the bound port until the env accepts it. 200 is the normal answer;
+ * 409 means a first register already won, which is not this process's to
+ * fix. 400 and 405 are contract errors and end the program; a network error
+ * or another status is retried, since the env may still be starting.
  */
 async function register(port: number): Promise<void> {
   let failures = 0;

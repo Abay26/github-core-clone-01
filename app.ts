@@ -6,11 +6,11 @@
 //   GQL  /api/graphql               GraphQL (single documents and batches)
 //   MCP  /mcp                       Model Context Protocol over Streamable HTTP
 //
-// Every API call carries `Authorization: Bearer <MAKEFUN_SHOP_TOKEN>`; a request
-// without the token, or with the wrong one, is 401. /healthz is the only
-// unauthenticated route. Every REST reply is application/json and carries a
-// non-empty X-GitHub-Request-Id header; a malformed JSON body is 400; an
-// unknown route is a 404 JSON body with a string message.
+// Every API call carries `Authorization: Bearer <MAKEFUN_SHOP_TOKEN>`; a
+// request without the token, or with the wrong one, is 401. /healthz is the
+// only unauthenticated route. Every REST reply is application/json and
+// carries a non-empty X-GitHub-Request-Id header; a malformed JSON body is
+// 400; an unknown route is a 404 JSON body with a string message.
 //
 // The store is in-memory and deterministic: no wall clock in state, no
 // unseeded randomness. Request ids are a per-process counter, so the same
@@ -51,14 +51,26 @@ function originOf(req: IncomingMessage): string {
   return `http://${host}`;
 }
 
-/** The request's path and query, parsed once (a request is parsed once, not per route). */
-function urlOf(req: IncomingMessage): { path: string; query: URLSearchParams } {
-  try {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    return { path: url.pathname, query: url.searchParams };
-  } catch {
-    return { path: '/', query: new URLSearchParams() };
+/**
+ * Split a request target into its path and raw query string without building
+ * a URL object: the router only needs the path, and only the REST branch
+ * ever needs parsed query parameters.
+ */
+function splitTarget(req: IncomingMessage): { path: string; query: string } {
+  const raw = req.url ?? '/';
+  const q = raw.indexOf('?');
+  if (q < 0) return { path: raw === '' ? '/' : raw, query: '' };
+  return { path: raw.slice(0, q) === '' ? '/' : raw.slice(0, q), query: raw.slice(q + 1) };
+}
+
+/** One query parameter out of a raw query string, or null. */
+function queryValue(query: string, name: string): string | null {
+  if (query === '') return null;
+  const want = `${name}=`;
+  for (const part of query.split('&')) {
+    if (part.startsWith(want)) return decodeURIComponent(part.slice(want.length));
   }
+  return null;
 }
 
 /** Whether this request carries the shop token. With no token configured (local dev only), any non-empty bearer token is accepted. */
@@ -176,8 +188,19 @@ function pushCommandsOf(lines: Array<Buffer | 'flush' | 'delim'>): PushCommand[]
  * when it grows past 32, so a long trial cannot grow it without limit.
  */
 function repoFingerprint(repo: Repo): string {
-  const refs = [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
-  return `${repo.objects.size}|${refs.map(([name, oid]) => `${name}=${oid}`).join(',')}`;
+  const names = [...repo.refs.keys()].sort();
+  let fp = `${repo.objects.size}|`;
+  for (const name of names) fp += `${name}=${repo.refs.get(name)},`;
+  return fp;
+}
+
+/** The fetch cache key, built by plain string joins (no JSON.stringify of the args object). */
+function fetchKey(version: 'v2' | 'v0', owner: string, repoName: string, repo: Repo, args: FetchArgs): string {
+  return (
+    `${version}|${owner}/${repoName}|${repoFingerprint(repo)}` +
+    `|w:${args.wants.join(',')}|h:${args.haves.join(',')}|s:${args.shallow.join(',')}` +
+    `|d:${args.depth ?? ''}|f:${args.filter ?? ''}`
+  );
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
@@ -214,18 +237,17 @@ export function createApp(): Server {
   }
 
   function sendText(res: ServerResponse, status: number, body: string, contentType = JSON_TYPE): void {
-    const text = body;
     res.writeHead(status, {
       'content-type': contentType,
-      'content-length': Buffer.byteLength(text),
+      'content-length': Buffer.byteLength(body),
       'x-github-request-id': requestId(),
     });
-    res.end(text);
+    res.end(body);
   }
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
-      const { path, query } = urlOf(req);
+      const { path, query } = splitTarget(req);
       const method = req.method ?? 'GET';
       const origin = originOf(req);
 
@@ -301,7 +323,7 @@ export function createApp(): Server {
             }
             body = isRecord(parsed.value) ? parsed.value : null;
           }
-          const answer = handleRest(store, method, restSegments, query, body, origin, `${origin}${path}`);
+          const answer = handleRest(store, method, restSegments, new URLSearchParams(query), body, origin, `${origin}${path}`);
           sendJson(res, answer.status, answer.body, answer.headers ?? {});
           return;
         }
@@ -311,7 +333,7 @@ export function createApp(): Server {
           const owner = segments[0]!;
           const repoName = segments[1]!.slice(0, -'.git'.length);
           const repo = store.getRepo(owner, repoName);
-          if (!repo) {
+          if (repo === undefined) {
             sendJson(res, 404, { message: 'Not Found' });
             return;
           }
@@ -319,7 +341,7 @@ export function createApp(): Server {
 
           // GET /{owner}/{repo}.git/info/refs?service=...
           if (method === 'GET' && gitPath[0] === 'info' && gitPath[1] === 'refs') {
-            const service = query.get('service') ?? 'git-upload-pack';
+            const service = queryValue(query, 'service') ?? 'git-upload-pack';
             if (service === 'git-receive-pack') {
               sendRaw(res, 200, advertiseV0(repo, 'git-receive-pack'), 'application/x-git-receive-pack-advertisement');
               return;
@@ -353,11 +375,11 @@ export function createApp(): Server {
               sendRaw(res, 200, handleLsRefs(repo, lsRefsArgsOf(lines)), resultType);
               return;
             }
-            // A fetch's bytes are a pure function of the fetch arguments and the
-            // repo's fingerprint (see repoFingerprint): identical concurrent
-            // clones share one pack build.
+            // A fetch's bytes are a pure function of the fetch arguments and
+            // the repo's fingerprint (see repoFingerprint): identical
+            // concurrent clones share one pack build.
             const fetch = (version: 'v2' | 'v0', args: FetchArgs): Buffer => {
-              const key = `${version}|${owner}/${repoName}|${repoFingerprint(repo)}|${JSON.stringify(args)}`;
+              const key = fetchKey(version, owner, repoName, repo, args);
               const hit = fetchCache.get(key);
               if (hit !== undefined) return hit;
               const built = version === 'v2' ? handleFetchV2(repo, args) : handleFetchV0(repo, args);
